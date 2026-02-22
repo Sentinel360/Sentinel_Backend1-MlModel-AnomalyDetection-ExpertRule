@@ -1,23 +1,20 @@
 import sys
 from pathlib import Path
 
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
 
-from utils.config import (
-    GHANA_GB_FILE, PORTO_IF_FILE,
-    GHANA_SCALER_FILE, PORTO_SCALER_FILE,
-    FEATURES_FILE, FUSION_CONFIG_FILE,
-)
+from core.ml_inference import HybridMLModel
+
+MODEL_DIR = str(_PROJECT_ROOT / 'models')
 
 st.set_page_config(
     page_title="Sentinel360 Model Tester",
@@ -30,64 +27,27 @@ st.markdown("**Test edge cases and analyze model predictions vs expected outcome
 
 
 @st.cache_resource
-def load_models():
+def load_model():
     try:
-        ghana_gb = joblib.load(GHANA_GB_FILE)
-        porto_if = joblib.load(PORTO_IF_FILE)
-        scaler_gh = joblib.load(GHANA_SCALER_FILE)
-        scaler_po = joblib.load(PORTO_SCALER_FILE)
-        features = joblib.load(FEATURES_FILE)
-        config = joblib.load(FUSION_CONFIG_FILE)
-        return {
-            'ghana_gb': ghana_gb,
-            'porto_if': porto_if,
-            'scaler_gh': scaler_gh,
-            'scaler_po': scaler_po,
-            'features': features,
-            'config': config,
-        }
+        return HybridMLModel(models_dir=MODEL_DIR)
     except Exception as e:
         st.error(f"Error loading models: {e}")
         return None
 
 
-models = load_models()
-if models is None:
+model = load_model()
+if model is None:
     st.stop()
 
-FEATURE_NAMES = models['features']
-WEIGHT_GB = models['config'].get('weight_gb', 0.7)
-WEIGHT_IF = models['config'].get('weight_if', 0.3)
-THRESHOLD_SAFE = models['config'].get('threshold_safe', 0.3)
-THRESHOLD_HIGH = models['config'].get('threshold_high', 0.7)
+FEATURE_NAMES = model.feature_names
+WEIGHT_GB = model.gb_weight
+WEIGHT_IF = model.if_weight
+THRESHOLD_SAFE = 0.3
+THRESHOLD_HIGH = 0.7
 
 
-def predict_hybrid(features_dict, models):
-    feature_array = np.array([[features_dict.get(f, 0) for f in FEATURE_NAMES]])
-
-    ghana_scaled = models['scaler_gh'].transform(feature_array)
-    gb_score = float(models['ghana_gb'].predict_proba(ghana_scaled)[0][1])
-
-    porto_scaled = models['scaler_po'].transform(feature_array)
-    if_raw = float(models['porto_if'].decision_function(porto_scaled)[0])
-    if_score = 1 / (1 + np.exp(-if_raw))
-
-    hybrid_score = WEIGHT_GB * gb_score + WEIGHT_IF * if_score
-
-    if hybrid_score < THRESHOLD_SAFE:
-        level, color = 'SAFE', 'green'
-    elif hybrid_score < THRESHOLD_HIGH:
-        level, color = 'MEDIUM', 'orange'
-    else:
-        level, color = 'HIGH RISK', 'red'
-
-    return {
-        'gb_score': gb_score,
-        'if_score': if_score,
-        'hybrid_score': hybrid_score,
-        'level': level,
-        'color': color,
-    }
+def predict_hybrid(features_dict, _model=None):
+    return model.predict(features_dict)
 
 
 # ── Test Scenarios (mapped to actual model features) ─────────────────────────
@@ -219,8 +179,8 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### Model Info")
 st.sidebar.info(f"""
 **Features:** {len(FEATURE_NAMES)}
-**Ghana GB:** {type(models['ghana_gb']).__name__}
-**Porto IF:** {type(models['porto_if']).__name__}
+**Ghana GB:** {type(model.ghana_gb).__name__}
+**Porto IF:** {type(model.porto_if).__name__}
 **Fusion:** {WEIGHT_GB}\u00d7GB + {WEIGHT_IF}\u00d7IF
 **Safe threshold:** < {THRESHOLD_SAFE}
 **High threshold:** \u2265 {THRESHOLD_HIGH}
@@ -251,7 +211,7 @@ if mode == "\U0001f4cb Pre-defined Scenarios":
 
     with col2:
         st.subheader("Model Prediction")
-        result = predict_hybrid(scenario['features'], models)
+        result = predict_hybrid(scenario['features'])
 
         st.metric("Hybrid Risk Score", f"{result['hybrid_score']:.3f}",
                   delta=result['level'])
@@ -364,7 +324,7 @@ elif mode == "\u270d\ufe0f Manual Input":
         submitted = st.form_submit_button("\U0001f52e Predict Risk")
 
     if submitted:
-        result = predict_hybrid(fi, models)
+        result = predict_hybrid(fi)
 
         st.markdown("---")
         st.subheader("Prediction Result")
@@ -396,7 +356,7 @@ else:
         progress = st.progress(0)
 
         for idx, (name, scenario) in enumerate(TEST_SCENARIOS.items()):
-            result = predict_hybrid(scenario['features'], models)
+            result = predict_hybrid(scenario['features'])
 
             expected_lower = scenario['expected'].lower()
             actual_lower = result['level'].lower()

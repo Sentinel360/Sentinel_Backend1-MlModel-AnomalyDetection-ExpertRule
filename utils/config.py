@@ -1,29 +1,54 @@
-"""Centralised configuration for Sentinel360."""
+"""
+Configuration constants
+"""
+
 import os
-from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Model configuration
+MODEL_DIR = os.getenv('MODEL_DIR', 'models')
+FUSION_GB_WEIGHT = float(os.getenv('FUSION_GB_WEIGHT', '0.7'))
+FUSION_IF_WEIGHT = float(os.getenv('FUSION_IF_WEIGHT', '0.3'))
 
-SUMO_HOME = os.environ.get('SUMO_HOME', '/opt/homebrew/opt/sumo/share/sumo')
+# Risk thresholds
+SAFE_THRESHOLD = 0.3
+MEDIUM_THRESHOLD = 0.7
 
-# Simulation files (inside simulation/)
-SIM_DIR = BASE_DIR / 'simulation'
-NETWORK_FILE = str(SIM_DIR / 'accra.net.xml')
-ROUTE_FILE = str(SIM_DIR / 'vehicles.rou.xml')
-CONFIG_FILE = str(SIM_DIR / 'simulation.sumocfg')
+# Route anomaly detection
+ROUTE_BUFFER_DISTANCE = int(os.getenv('ROUTE_BUFFER_DISTANCE', '100'))
+ROUTE_DEVIATION_CRITICAL = int(os.getenv('ROUTE_DEVIATION_CRITICAL', '500'))
+ROUTE_REROUTE_CHECK_INTERVAL = int(os.getenv('ROUTE_REROUTE_CHECK_INTERVAL', '30'))
 
-# Model files (inside models/)
-MODEL_DIR = str(BASE_DIR / 'models')
-GHANA_GB_FILE = str(BASE_DIR / 'models' / 'ghana_gb_model.pkl')
-PORTO_IF_FILE = str(BASE_DIR / 'models' / 'porto_if_model.pkl')
-GHANA_SCALER_FILE = str(BASE_DIR / 'models' / 'ghana_scaler.pkl')
-PORTO_SCALER_FILE = str(BASE_DIR / 'models' / 'porto_scaler.pkl')
-FEATURES_FILE = str(BASE_DIR / 'models' / 'feature_names.pkl')
-FUSION_CONFIG_FILE = str(BASE_DIR / 'models' / 'fusion_config.pkl')
+# Google Maps API
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
 
-STEP_LENGTH = 1.0
-MAX_STEPS = 1000
-UPDATE_INTERVAL = 5
+# Alert thresholds
+CONSECUTIVE_HIGH_RISK_THRESHOLD = int(os.getenv('CONSECUTIVE_HIGH_RISK', '3'))
+ALERT_COOLDOWN_PERIOD = int(os.getenv('ALERT_COOLDOWN', '30'))
 
-COLORS = {'SAFE': (0, 255, 0), 'MEDIUM': (255, 255, 0), 'HIGH': (255, 0, 0)}
-RISK_THRESHOLDS = {'SAFE': 0.3, 'MEDIUM': 0.7}
+# Feature extraction
+FEATURE_WINDOW_SIZE = int(os.getenv('FEATURE_WINDOW_SIZE', '10'))
+
+# Logging
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Feature names (must match training)
+FEATURE_NAMES = [
+    'avg_speed',
+    'max_speed',
+    'speed_std',
+    'avg_acceleration',
+    'max_acceleration',
+    'harsh_accel_count',
+    'harsh_brake_count',
+    'stop_count',
+    'avg_stop_duration',
+    'total_distance',
+    'distance_per_stop',
+    'time_of_day',
+    'day_of_week',
+    'trip_duration',
+    'speed_changes',
+    'route_straightness',
+    'idle_time_ratio',
+    'avg_trip_speed',
+]

@@ -9,16 +9,35 @@ import sys
 import os
 import time
 import subprocess
+import math
 from pathlib import Path
+from collections import defaultdict, deque
+from datetime import datetime
 
 sys.stdout.reconfigure(line_buffering=True)
 
-# Ensure project root is on sys.path so core/utils imports work
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-from utils.config import *
+# ── SUMO simulation config (separate from production utils.config) ────────────
+SIM_DIR = _PROJECT_ROOT / 'simulation'
+NETWORK_FILE = str(SIM_DIR / 'accra.net.xml')
+ROUTE_FILE = str(SIM_DIR / 'vehicles.rou.xml')
+CONFIG_FILE = str(SIM_DIR / 'simulation.sumocfg')
+
+MODEL_DIR = str(_PROJECT_ROOT / 'models')
+GHANA_GB_FILE = str(_PROJECT_ROOT / 'models' / 'ghana_gb_model.pkl')
+GHANA_SCALER_FILE = str(_PROJECT_ROOT / 'models' / 'ghana_scaler.pkl')
+PORTO_IF_FILE = str(_PROJECT_ROOT / 'models' / 'porto_if_model.pkl')
+PORTO_SCALER_FILE = str(_PROJECT_ROOT / 'models' / 'porto_scaler.pkl')
+FEATURES_FILE = str(_PROJECT_ROOT / 'models' / 'feature_names.pkl')
+FUSION_CONFIG_FILE = str(_PROJECT_ROOT / 'models' / 'fusion_config.pkl')
+
+STEP_LENGTH = 1.0
+MAX_STEPS = 1000
+UPDATE_INTERVAL = 5
+COLORS = {'SAFE': (0, 255, 0), 'MEDIUM': (255, 255, 0), 'HIGH': (255, 0, 0)}
 
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -28,9 +47,10 @@ else:
 
 try:
     import traci
-    from core.risk_fusion import HybridMonitor
 except ImportError as e:
-    sys.exit(f"Failed to import: {e}")
+    sys.exit(f"Failed to import traci: {e}")
+
+import numpy as np
 
 USE_GUI = '--gui' in sys.argv or '-g' in sys.argv
 SUMO_BINARY = 'sumo-gui' if USE_GUI else 'sumo'
@@ -38,13 +58,181 @@ TRACI_RETRIES = 3
 TRACI_RETRY_DELAY = 2.0
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUMO-specific HybridMonitor — thin adapter around core.ml_inference
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HybridMonitor:
+    """Per-vehicle risk monitor for the SUMO simulation loop."""
+
+    def __init__(self):
+        from core.ml_inference import HybridMLModel
+
+        self.colors = COLORS
+        self.ml_model = None
+        self.use_rule_based = False
+
+        try:
+            self.ml_model = HybridMLModel(models_dir=MODEL_DIR)
+            self.mode = 'hybrid'
+        except Exception as e:
+            print(f"\u26a0\ufe0f ML model failed to load: {e}")
+            self.mode = 'rule_based'
+            self.use_rule_based = True
+            print("\u26a0\ufe0f Falling back to rule-based scoring")
+
+        self.vehicles = defaultdict(lambda: {
+            'speeds': deque(maxlen=10),
+            'positions': deque(maxlen=10),
+            'accels': deque(maxlen=10),
+            'distance': 0.0,
+            'stops': 0,
+            'last_speed': 0.0,
+            'trip_start': None,
+            'risk_score': 0.0,
+            'risk_level': 'SAFE',
+        })
+
+    # ---------------------------------------------------------------- update
+
+    def update_vehicle(self, veh_id, speed, position, timestamp):
+        v = self.vehicles[veh_id]
+        if v['trip_start'] is None:
+            v['trip_start'] = timestamp
+
+        speed_kmh = speed * 3.6
+        v['speeds'].append(speed_kmh)
+
+        if v['positions']:
+            prev = v['positions'][-1]
+            dx, dy = position[0] - prev[0], position[1] - prev[1]
+            v['distance'] += math.sqrt(dx * dx + dy * dy)
+        v['positions'].append(position)
+
+        if v['last_speed'] > 0 and speed_kmh == 0:
+            v['stops'] += 1
+
+        if len(v['speeds']) >= 2:
+            accel = (speed - v['last_speed'] / 3.6)
+            v['accels'].append(accel)
+
+        v['last_speed'] = speed_kmh
+
+    # ---------------------------------------------------------------- predict
+
+    def predict_risk(self, veh_id, timestamp):
+        v = self.vehicles[veh_id]
+        trip_dur = max(1, timestamp - (v['trip_start'] or timestamp))
+
+        if self.use_rule_based:
+            return self._rule_based_risk(v, trip_dur)
+
+        features = self._build_features(v, trip_dur)
+        try:
+            result = self.ml_model.predict(features)
+            score = result['hybrid_score']
+            level = result['level']
+        except Exception:
+            return self._rule_based_risk(v, trip_dur)
+
+        if level == 'HIGH RISK':
+            level_key = 'HIGH'
+        elif level == 'MEDIUM':
+            level_key = 'MEDIUM'
+        else:
+            level_key = 'SAFE'
+
+        v['risk_score'] = score
+        v['risk_level'] = level_key
+        color = self.colors.get(level_key, (0, 255, 0))
+        return score, level_key, (*color, 255)
+
+    # ---------------------------------------------------------- features
+
+    def _build_features(self, v, trip_dur):
+        spd = v['speeds'][-1] if v['speeds'] else 0
+        accel = v['accels'][-1] if v['accels'] else 0
+        accel_var = float(np.std(v['accels'])) if len(v['accels']) > 1 else 0
+        dist_km = v['distance'] / 1000
+        now = datetime.now()
+        hour = now.hour
+
+        return {
+            'speed': spd,
+            'acceleration': accel,
+            'acceleration_variation': accel_var,
+            'trip_duration': trip_dur,
+            'trip_distance': dist_km,
+            'stop_events': v['stops'],
+            'road_encoded': 0,
+            'weather_encoded': 0,
+            'traffic_encoded': 1,
+            'hour': hour,
+            'month': now.month,
+            'avg_speed': dist_km / (trip_dur / 3600 + 0.001),
+            'stops_per_km': v['stops'] / (dist_km + 0.1),
+            'accel_abs': abs(accel),
+            'speed_normalized': spd / 100,
+            'speed_squared': spd ** 2,
+            'is_rush_hour': int(7 <= hour < 10 or 16 <= hour < 19),
+            'is_night': int(hour >= 22 or hour <= 5),
+        }
+
+    # --------------------------------------------------------- rule fallback
+
+    def _rule_based_risk(self, v, trip_dur):
+        spd = v['speeds'][-1] if v['speeds'] else 0
+        accel_var = float(np.std(v['accels'])) if len(v['accels']) > 1 else 0
+
+        score = 0.0
+        if spd > 80:
+            score += 0.4
+        elif spd > 50:
+            score += 0.2
+        if accel_var > 3:
+            score += 0.3
+        elif accel_var > 1.5:
+            score += 0.15
+        dist_km = v['distance'] / 1000
+        if dist_km > 0.5 and v['stops'] / dist_km > 3:
+            score += 0.2
+
+        score = min(1.0, score)
+        if score < 0.3:
+            lvl = 'SAFE'
+        elif score < 0.7:
+            lvl = 'MEDIUM'
+        else:
+            lvl = 'HIGH'
+
+        v['risk_score'] = score
+        v['risk_level'] = lvl
+        color = self.colors.get(lvl, (0, 255, 0))
+        return score, lvl, (*color, 255)
+
+    # ---------------------------------------------------------- stats
+
+    def get_statistics(self):
+        if not self.vehicles:
+            return None
+        total = len(self.vehicles)
+        safe = sum(1 for v in self.vehicles.values() if v['risk_level'] == 'SAFE')
+        med = sum(1 for v in self.vehicles.values() if v['risk_level'] == 'MEDIUM')
+        high = sum(1 for v in self.vehicles.values() if v['risk_level'] == 'HIGH')
+        avg = sum(v['risk_score'] for v in self.vehicles.values()) / total
+        return {'total': total, 'safe': safe, 'medium': med, 'high': high, 'avg_risk': avg}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Validation helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def validate_environment():
     print("\n\U0001f50d Validating environment...")
     sumo_home = os.environ.get('SUMO_HOME')
     if not sumo_home:
         return False, "SUMO_HOME not set"
     print(f"   \u2705 SUMO_HOME: {sumo_home}")
-
     try:
         result = subprocess.run([SUMO_BINARY, '--version'],
                                 capture_output=True, text=True, timeout=5)
@@ -116,6 +304,10 @@ def validate_routes():
         return False, str(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUMO lifecycle
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def start_sumo():
     print(f"\n\U0001f680 Starting SUMO...")
     sumo_cmd = [
@@ -123,7 +315,6 @@ def start_sumo():
         '--step-length', str(STEP_LENGTH),
         '--no-warnings', '--start', '--quit-on-end',
     ]
-
     for attempt in range(1, TRACI_RETRIES + 1):
         try:
             try:
@@ -212,6 +403,10 @@ def run_loop(monitor):
     except Exception as e:
         return False, f"Loop failed: {e}"
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     print("\n" + "=" * 80)
