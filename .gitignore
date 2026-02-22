@@ -6,6 +6,9 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
+htmlcov/
+.coverage
 
 # OS
 .DS_Store
@@ -17,12 +20,16 @@ Thumbs.db
 *.swp
 *.swo
 *~
+.cursor/
 
 # Environment
 .env
 venv/
 env/
 .conda/
+
+# ML Models (too large for git)
+models/*.pkl
 
 # SUMO intermediate/generated
 accra_osm_network/

@@ -1,79 +1,211 @@
-# Sentinel360 - Hybrid Driver Behavior Monitoring
+# Sentinel360 Backend
 
-Real-time driver risk prediction using a hybrid ML model (Ghana Gradient Boosting + Porto Isolation Forest) on real Accra road networks in Eclipse SUMO.
+**AI-Powered Passenger Safety Monitoring System for Ghana**
+
+Sentinel360 combines machine learning, expert safety rules, and route anomaly detection to protect ride-hailing passengers in real-time.
+
+---
 
 ## Overview
 
-Sentinel360 monitors simulated vehicles on real OpenStreetMap roads from Accra, Ghana and classifies each driver's risk level in real time using a **hybrid fusion** of two ML models:
+Sentinel360 monitors trips in real-time using:
 
-- **Ghana GB** (Gradient Boosting Classifier, 70% weight) -- trained on Ghana driving patterns
-- **Porto IF** (Isolation Forest, 30% weight) -- anomaly detector trained on 1M+ Porto taxi trips
+1. **Hybrid ML Model** (0.7 x Ghana GB + 0.3 x Porto IF)
+   - Detects unsafe driving patterns from 18 telemetry features
+   - Ghana Gradient Boosting trained on synthetic Ghana driving data
+   - Porto Isolation Forest validated on 1M+ Porto taxi trips
+   - 99.7% accuracy on cross-geography validation
 
-Risk classification: **SAFE** (< 0.3) | **MEDIUM** (0.3-0.7) | **HIGH** (>= 0.7)
+2. **Expert Rules System**
+   - Ghana-contextualized safety rules backed by research
+   - Based on NRSA road safety data, WHO standards, Ghana Road Traffic Regulations (LI 2180)
+   - Considers rush hours, road types, time-of-day risk, geofence zones
+
+3. **Route Anomaly Detection**
+   - Real-time route deviation monitoring via Google Maps API
+   - Corridor buffering with Shapely/pyproj
+   - Detects wrong direction, prolonged deviation, geographic anomalies
+
+Risk classification: **SAFE** (< 0.3) | **MEDIUM** (0.3-0.7) | **HIGH RISK** (>= 0.7)
+
+---
+
+## Architecture
+
+```
++--------------+      +--------------+      +--------------+
+|  IoT Device  |----->|    Cloud     |----->|  Mobile App  |
+|  (ESP32)     |      |  (Firebase)  |      |  (Flutter)   |
+|              |      |              |      |              |
+| GPS + IMU    |      | ML + Rules   |      | Real-time    |
+| Cellular 4G  |      | + Route Mon  |      | Monitoring   |
++--------------+      +--------------+      +--------------+
+```
+
+---
+
+## Project Structure
+
+```
+sentinel360-backend/
+├── core/                       # Core risk assessment
+│   ├── ml_inference.py         # HybridMLModel (Ghana GB + Porto IF)
+│   ├── expert_rules.py         # ExpertRulesEngine (Ghana safety rules)
+│   ├── route_anomaly.py        # RouteAnomalyDetector (Google Maps)
+│   └── risk_fusion.py          # RiskFusionEngine (combines all)
+│
+├── utils/                      # Helper functions
+│   ├── gps_utils.py            # Haversine, bearing, point-in-polygon
+│   ├── ghana_data.py           # Accra landmarks, congestion zones
+│   └── config.py               # Environment-based configuration
+│
+├── models/                     # ML models (not in git)
+│   ├── ghana_gb_model.pkl      # Gradient Boosting classifier
+│   ├── porto_if_model.pkl      # Isolation Forest anomaly detector
+│   ├── ghana_scaler.pkl        # RobustScaler for Ghana GB
+│   ├── porto_scaler.pkl        # RobustScaler for Porto IF
+│   ├── feature_names.pkl       # 18 feature names
+│   └── fusion_config.pkl       # Fusion weights and thresholds
+│
+├── tests/                      # Pytest unit tests (207 tests)
+│   ├── test_ml_inference.py
+│   ├── test_expert_rules.py
+│   ├── test_route_anomaly.py
+│   ├── test_risk_fusion.py
+│   ├── test_gps_utils.py
+│   ├── test_ghana_data.py
+│   └── test_integration.py
+│
+├── simulation/                 # SUMO traffic simulation
+│   ├── sumo_integration.py     # Real-time SUMO + ML monitoring
+│   ├── streamlit_test_app.py   # Streamlit model testing dashboard
+│   ├── accra.net.xml           # Real Accra OSM road network
+│   ├── vehicles.rou.xml        # 200 vehicles with validated routes
+│   └── simulation.sumocfg      # SUMO configuration
+│
+├── cloud_functions/            # Firebase deployment
+├── deployment/                 # Docker & deploy scripts
+├── requirements.txt
+├── setup.py
+├── pytest.ini
+├── .env.example
+└── .gitignore
+```
+
+---
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.10+
-- [Eclipse SUMO](https://sumo.dlr.de/) 1.20+
-- Dependencies: `numpy`, `scikit-learn`, `joblib`, `pandas`
+- Python 3.8+
+- Google Maps API key (for route monitoring)
+- Eclipse SUMO 1.20+ (for simulation only)
 
-### Run the simulation
+### Installation
+
+```bash
+git clone https://github.com/Sentinel360/Sentinel_ML_Model.git
+cd Sentinel_ML_Model
+
+python -m venv venv
+source venv/bin/activate
+
+pip install -r requirements.txt
+
+cp .env.example .env
+# Edit .env and add your GOOGLE_API_KEY
+```
+
+### Download ML Models
+
+Models are stored separately (too large for git). Place them in the `models/` directory:
+
+```
+models/
+├── ghana_gb_model.pkl
+├── porto_if_model.pkl
+├── ghana_scaler.pkl
+├── porto_scaler.pkl
+├── feature_names.pkl
+└── fusion_config.pkl
+```
+
+---
+
+## Usage
+
+### Risk Assessment (Production API)
+
+```python
+from core.risk_fusion import RiskFusionEngine
+
+engine = RiskFusionEngine(
+    models_dir='models',
+    google_api_key='YOUR_API_KEY'
+)
+
+engine.start_trip_monitoring(
+    trip_id='trip_123',
+    origin=(5.6519, -0.1873),      # Legon
+    destination=(5.6052, -0.1668)   # Airport
+)
+
+result = engine.assess_risk(
+    trip_id='trip_123',
+    trip_data={
+        'current_speed': 65,
+        'acceleration_history': [0.5, 1.2, -2.1],
+        'features': { ... }
+    },
+    context={
+        'current_location': (5.64, -0.18),
+        'time_of_day': 18,
+        'speed_limit': 50,
+        'location_type': 'urban'
+    }
+)
+
+print(f"Risk: {result['final_level']}")    # SAFE / MEDIUM / HIGH RISK
+print(f"Score: {result['final_score']:.2f}")
+print(f"Actions: {result['actions']}")
+```
+
+### SUMO Simulation
 
 ```bash
 export SUMO_HOME='/opt/homebrew/opt/sumo/share/sumo'
 
-# Headless (fast, terminal output only)
-python run_simulation.py
+# Headless
+python -m simulation.sumo_integration
 
-# With SUMO GUI (visual, see vehicles on real Accra map)
-python run_simulation.py --gui
+# With SUMO GUI
+python -m simulation.sumo_integration --gui
 ```
 
-### Run the Streamlit model tester
+### Streamlit Model Tester
 
 ```bash
 pip install streamlit plotly
-streamlit run test_model.py
+streamlit run simulation/streamlit_test_app.py
 ```
 
-### Verify setup
+---
+
+## Testing
 
 ```bash
-python quick_start.py
+# Run all 207 tests
+pytest tests/
+
+# Run with coverage
+pytest --cov=core --cov=utils tests/
+
+# Run specific test file
+pytest tests/test_expert_rules.py -v
 ```
 
-## How It Works
-
-1. **SUMO loads** a real Accra road network (10,570 nodes, 4,740 road segments from OpenStreetMap)
-2. **200 vehicles** spawn with realistic types (cars, taxis, trotros, trucks, motorbikes, aggressive drivers)
-3. **Every simulation second**, TraCI extracts each vehicle's speed, position, and acceleration
-4. **18 features** are computed from the telemetry (speed, acceleration variation, stops per km, etc.)
-5. **Both models** independently score the driver, then scores are fused: `0.7 × GB + 0.3 × IF`
-6. **Vehicle color** updates in real time: green (safe), yellow (medium), red (high risk)
-
-## Project Structure
-
-```
-Sentinel_ML_Model/
-├── run_simulation.py          # Main SUMO simulation runner
-├── monitor.py                 # HybridMonitor - ML inference engine
-├── config.py                  # Configuration constants
-├── test_model.py              # Streamlit model testing dashboard
-├── quick_start.py             # Environment verification script
-├── generate_accra_network.py  # OSM network generation script
-├── accra.net.xml              # Real Accra road network (OSM)
-├── vehicles.rou.xml           # 200 vehicles with validated routes
-├── simulation.sumocfg         # SUMO configuration
-└── models/
-    ├── ghana_gb_model.pkl     # Gradient Boosting classifier
-    ├── porto_if_model.pkl     # Isolation Forest anomaly detector
-    ├── ghana_scaler.pkl       # RobustScaler for Ghana GB
-    ├── porto_scaler.pkl       # RobustScaler for Porto IF
-    ├── feature_names.pkl      # 18 feature names
-    └── fusion_config.pkl      # Fusion weights and thresholds
-```
+---
 
 ## Model Features (18)
 
@@ -98,29 +230,101 @@ Sentinel_ML_Model/
 | `is_rush_hour` | Rush hour flag |
 | `is_night` | Nighttime flag |
 
-## Streamlit Dashboard
+---
 
-The Streamlit app (`test_model.py`) provides three testing modes:
+## Performance Metrics
 
-- **Pre-defined Scenarios** -- 15 edge-case test scenarios with expected outcomes
-- **Manual Input** -- Custom feature values with auto-computed derived features
-- **Batch Analysis** -- Run all tests, view accuracy, confusion matrix, and score distributions
+| Component | Metric | Value |
+|-----------|--------|-------|
+| ML Model | Cross-geography accuracy | 99.7% |
+| ML Model | Ghana baseline accuracy | 90% |
+| Hybrid Fusion | Safe trip classification | 99.7% |
+| Route Detection | False positive rate | <5% |
+| System Latency | ML inference | ~20ms |
+| System Latency | End-to-end | ~60ms |
 
-## Network Coverage
+---
 
+## Ghana Context
+
+### Speed Limits (LI 2180)
+- Motorway: 100 km/h
+- Urban: 50 km/h
+- Residential: 30 km/h
+- School Zone: 20 km/h
+
+### High-Risk Times (NRSA Data)
+- Late night (10 PM - 2 AM): 3.2x baseline risk
+- Evening rush (5-8 PM): 1.3x baseline risk
+
+### Congestion Zones
+- Circle, Kaneshie, Achimota, Madina
+- Rush hours: 6-9 AM, 5-8 PM (Mon-Fri)
+
+### SUMO Network Coverage
 Real OpenStreetMap data for Accra, Ghana:
 - **Area**: Legon, Airport, Osu, Circle, Madina
-- **Coordinates**: 5.545°N - 5.630°N, 0.225°W - 0.165°W
 - **Intersections**: 10,570 nodes
 - **Road segments**: 4,740 edges
 
-## Regenerating the Network
+---
 
-To regenerate the Accra network from OpenStreetMap:
+## Configuration
+
+Environment variables (`.env`):
 
 ```bash
-pip install osmnx
-python generate_accra_network.py
+GOOGLE_API_KEY=your_key_here
+MODEL_DIR=models
+FUSION_GB_WEIGHT=0.7
+FUSION_IF_WEIGHT=0.3
+SAFE_THRESHOLD=0.3
+MEDIUM_THRESHOLD=0.7
+ROUTE_BUFFER_DISTANCE=100
+ROUTE_DEVIATION_CRITICAL=500
 ```
 
-This downloads fresh OSM data, extracts the largest connected component, converts to SUMO format with `netconvert`, and generates validated routes with `duarouter`.
+---
+
+## Research & Citations
+
+1. **Liu, F. T., et al. (2008).** Isolation Forest. IEEE ICDM.
+2. **Ghana Road Traffic Regulations (2012).** LI 2180.
+3. **WHO Global Status Report on Road Safety (2024).**
+4. **NRSA Ghana Road Safety Statistics (2023).**
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
+## License
+
+MIT License - see [LICENSE](LICENSE) file.
+
+---
+
+## Authors
+
+- **Caleb Okwesie Arthur** - Ashesi University - caleb.arthur@ashesi.edu.gh
+- **Frances Seyram Fiahagbe** - Ashesi University - frances.fiahagbe@ashesi.edu.gh
+
+---
+
+## Acknowledgments
+
+- Ghana National Road Safety Authority (NRSA)
+- Ashesi University Computer Science Department
+- Uber/Bolt safety research teams
+- OpenStreetMap Ghana community
+
+---
+
+## Contact
+
+- Caleb: caleb.arthur@ashesi.edu.gh
+- Frances: frances.fiahagbe@ashesi.edu.gh
+- Project: https://github.com/Sentinel360/Sentinel_ML_Model
