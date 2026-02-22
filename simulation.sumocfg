@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <input>
+        <net-file value="accra.net.xml"/>
+        <route-files value="vehicles.rou.xml"/>
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="1000"/>
+        <step-length value="1.0"/>
+    </time>
+    <processing>
+        <time-to-teleport value="180"/>
+        <collision.action value="warn"/>
+        <ignore-route-errors value="true"/>
+    </processing>
+    <report>
+        <verbose value="false"/>
+        <no-step-log value="true"/>
+        <no-warnings value="true"/>
+    </report>
+</configuration>

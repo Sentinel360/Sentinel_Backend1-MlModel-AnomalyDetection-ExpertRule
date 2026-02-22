@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# SUMO intermediate/generated
+accra_osm_network/
+cache/
+*.alt.xml
+
+# Conda / venv
+.conda/
+venv/
+env/
+*.env
+
+# Temp files
+*.old
+*.backup
+*.bak
+*.tmp
