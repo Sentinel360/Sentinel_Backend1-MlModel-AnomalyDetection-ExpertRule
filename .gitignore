@@ -18,18 +18,18 @@ Thumbs.db
 *.swo
 *~
 
+# Environment
+.env
+venv/
+env/
+.conda/
+
 # SUMO intermediate/generated
 accra_osm_network/
 cache/
 *.alt.xml
 
-# Conda / venv
-.conda/
-venv/
-env/
-*.env
-
-# Temp files
+# Temp
 *.old
 *.backup
 *.bak
