@@ -22,6 +22,9 @@ Thumbs.db
 *~
 .cursor/
 
+# Node / Firebase functions
+cloud_functions/node_modules/
+
 # Environment
 .env
 venv/

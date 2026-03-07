@@ -1,0 +1,18 @@
+# Cloud Build source ignore rules.
+# IMPORTANT: include models/*.pkl for ML container startup.
+
+.git
+.gitignore
+.cursor
+__pycache__/
+*.pyc
+.pytest_cache/
+htmlcov/
+cloud_functions/node_modules/
+venv/
+env/
+.env
+
+# Keep model artifacts in upload context for Cloud Run image build.
+!models/
+!models/**

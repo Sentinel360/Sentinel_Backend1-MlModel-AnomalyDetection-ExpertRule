@@ -4,6 +4,7 @@ SUMO Real-Time Traffic Simulation with Hybrid Driver Behavior Monitoring
 Run from project root:
     python -m simulation.sumo_integration          (headless)
     python -m simulation.sumo_integration --gui    (with SUMO GUI)
+    python -m simulation.sumo_integration --gui --presentation
 """
 import sys
 import os
@@ -53,6 +54,11 @@ except ImportError as e:
 import numpy as np
 
 USE_GUI = '--gui' in sys.argv or '-g' in sys.argv
+PRESENTATION_MODE = (
+    '--presentation' in sys.argv
+    or '--demo' in sys.argv
+    or os.environ.get('SENTINEL_PRESENTATION_MODE', '0') == '1'
+)
 SUMO_BINARY = 'sumo-gui' if USE_GUI else 'sumo'
 TRACI_RETRIES = 3
 TRACI_RETRY_DELAY = 2.0
@@ -65,12 +71,13 @@ TRACI_RETRY_DELAY = 2.0
 class HybridMonitor:
     """Per-vehicle risk monitor for the SUMO simulation loop."""
 
-    def __init__(self):
+    def __init__(self, presentation_mode=False):
         from core.ml_inference import HybridMLModel
 
         self.colors = COLORS
         self.ml_model = None
         self.use_rule_based = False
+        self.presentation_mode = presentation_mode
 
         try:
             self.ml_model = HybridMLModel(models_dir=MODEL_DIR)
@@ -91,14 +98,20 @@ class HybridMonitor:
             'trip_start': None,
             'risk_score': 0.0,
             'risk_level': 'SAFE',
+            'veh_type': 'car',
         })
+
+        if self.presentation_mode:
+            print("   Presentation mode: ON (risk diversity boost enabled)")
 
     # ---------------------------------------------------------------- update
 
-    def update_vehicle(self, veh_id, speed, position, timestamp):
+    def update_vehicle(self, veh_id, speed, position, timestamp, veh_type=None):
         v = self.vehicles[veh_id]
         if v['trip_start'] is None:
             v['trip_start'] = timestamp
+        if veh_type:
+            v['veh_type'] = veh_type
 
         speed_kmh = speed * 3.6
         v['speeds'].append(speed_kmh)
@@ -131,13 +144,30 @@ class HybridMonitor:
         try:
             result = self.ml_model.predict(features)
             score = result['hybrid_score']
-            level = result['level']
         except Exception:
             return self._rule_based_risk(v, trip_dur)
 
-        if level == 'HIGH RISK':
+        if self.presentation_mode:
+            heuristic = self._heuristic_score(v, trip_dur)
+            type_bias = {
+                'aggressive': 0.12,
+                'motorbike': 0.06,
+                'trotro': 0.05,
+                'truck': 0.03,
+                'taxi': 0.01,
+                'car': 0.00,
+            }
+            score = min(
+                1.0,
+                max(
+                    0.0,
+                    0.75 * score + 0.25 * heuristic + type_bias.get(v.get('veh_type', 'car'), 0.0),
+                ),
+            )
+
+        if score >= 0.7:
             level_key = 'HIGH'
-        elif level == 'MEDIUM':
+        elif score >= 0.3:
             level_key = 'MEDIUM'
         else:
             level_key = 'SAFE'
@@ -154,8 +184,24 @@ class HybridMonitor:
         accel = v['accels'][-1] if v['accels'] else 0
         accel_var = float(np.std(v['accels'])) if len(v['accels']) > 1 else 0
         dist_km = v['distance'] / 1000
+        veh_type = v.get('veh_type', 'car')
         now = datetime.now()
         hour = now.hour
+        road_encoded = 0
+        weather_encoded = 0
+        traffic_encoded = 1
+
+        if self.presentation_mode:
+            # Cycle through a simulated day so night/rush-hour logic is visible in demos.
+            hour = int((trip_dur // 40) % 24)
+            road_map = {'car': 0, 'taxi': 0, 'trotro': 0, 'motorbike': 0, 'aggressive': 1, 'truck': 2}
+            traffic_map = {'car': 1, 'taxi': 2, 'trotro': 2, 'motorbike': 1, 'aggressive': 2, 'truck': 1}
+            road_encoded = road_map.get(veh_type, 0)
+            traffic_encoded = traffic_map.get(veh_type, 1)
+            if (hour >= 22 or hour <= 5) and veh_type in {'aggressive', 'motorbike', 'trotro'}:
+                weather_encoded = 1
+            accel_boost = {'aggressive': 1.4, 'motorbike': 1.25, 'trotro': 1.15}.get(veh_type, 1.0)
+            accel_var *= accel_boost
 
         return {
             'speed': spd,
@@ -164,9 +210,9 @@ class HybridMonitor:
             'trip_duration': trip_dur,
             'trip_distance': dist_km,
             'stop_events': v['stops'],
-            'road_encoded': 0,
-            'weather_encoded': 0,
-            'traffic_encoded': 1,
+            'road_encoded': road_encoded,
+            'weather_encoded': weather_encoded,
+            'traffic_encoded': traffic_encoded,
             'hour': hour,
             'month': now.month,
             'avg_speed': dist_km / (trip_dur / 3600 + 0.001),
@@ -180,9 +226,13 @@ class HybridMonitor:
 
     # --------------------------------------------------------- rule fallback
 
-    def _rule_based_risk(self, v, trip_dur):
+    def _heuristic_score(self, v, trip_dur):
         spd = v['speeds'][-1] if v['speeds'] else 0
         accel_var = float(np.std(v['accels'])) if len(v['accels']) > 1 else 0
+        veh_type = v.get('veh_type', 'car')
+        hour = datetime.now().hour
+        if self.presentation_mode:
+            hour = int((trip_dur // 40) % 24)
 
         score = 0.0
         if spd > 80:
@@ -197,7 +247,17 @@ class HybridMonitor:
         if dist_km > 0.5 and v['stops'] / dist_km > 3:
             score += 0.2
 
-        score = min(1.0, score)
+        if hour >= 22 or hour <= 5:
+            score += 0.08
+        if veh_type == 'aggressive':
+            score += 0.12
+        elif veh_type in {'motorbike', 'trotro'}:
+            score += 0.05
+
+        return min(1.0, score)
+
+    def _rule_based_risk(self, v, trip_dur):
+        score = self._heuristic_score(v, trip_dur)
         if score < 0.3:
             lvl = 'SAFE'
         elif score < 0.7:
@@ -361,7 +421,8 @@ def run_loop(monitor):
                     try:
                         spd = traci.vehicle.getSpeed(vid)
                         pos = traci.vehicle.getPosition(vid)
-                        monitor.update_vehicle(vid, spd, pos, step)
+                        veh_type = traci.vehicle.getTypeID(vid)
+                        monitor.update_vehicle(vid, spd, pos, step, veh_type)
                         score, level, color = monitor.predict_risk(vid, step)
                         traci.vehicle.setColor(vid, color)
                     except traci.exceptions.TraCIException:
@@ -423,7 +484,7 @@ def main():
 
     print("\n\U0001f4e6 Loading hybrid monitor (Ghana GB + Porto IF)...")
     try:
-        monitor = HybridMonitor()
+        monitor = HybridMonitor(presentation_mode=PRESENTATION_MODE)
     except Exception as e:
         print(f"\n\u274c Monitor init failed: {e}")
         sys.exit(1)

@@ -1,0 +1,12 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - ml_api/Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/sentinel360-final/cloud-run-source-deploy/sentinel360-ml:manual
+      - .
+
+images:
+  - us-central1-docker.pkg.dev/sentinel360-final/cloud-run-source-deploy/sentinel360-ml:manual
