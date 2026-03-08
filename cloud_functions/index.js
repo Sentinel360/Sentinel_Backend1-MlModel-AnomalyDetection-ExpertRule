@@ -37,6 +37,13 @@ function currentStateRef(tripId) {
     .doc("latest");
 }
 
+function normalizeLatLon(value) {
+  if (!value || typeof value !== "object") return { lat: 0, lon: 0 };
+  const lat = value.lat ?? value.latitude ?? value._latitude ?? 0;
+  const lon = value.lon ?? value.lng ?? value.longitude ?? value._longitude ?? 0;
+  return { lat: Number(lat), lon: Number(lon) };
+}
+
 async function getMlApiAuthHeaders() {
   const mlApiUrl = getMlApiUrl();
   if (!mlApiUrl) return {};
@@ -213,8 +220,8 @@ exports.onTripStart = functions.firestore
         "/trip/start",
         {
           trip_id: tripId,
-          origin: tripData.origin || { lat: 0, lon: 0 },
-          destination: tripData.destination || { lat: 0, lon: 0 },
+          origin: normalizeLatLon(tripData.origin),
+          destination: normalizeLatLon(tripData.destination),
         },
         5000,
       );

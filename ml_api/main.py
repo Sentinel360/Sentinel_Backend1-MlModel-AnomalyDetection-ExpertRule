@@ -27,8 +27,8 @@ app = FastAPI(title="Sentinel360 ML API", version="1.0.0")
 
 class TripStartRequest(BaseModel):
     trip_id: str
-    origin: Dict[str, float]
-    destination: Dict[str, float]
+    origin: Dict
+    destination: Dict
 
 
 class SensorDataRequest(BaseModel):
@@ -81,19 +81,22 @@ def root() -> Dict:
 @app.post("/trip/start")
 def start_trip(request: TripStartRequest) -> Dict:
     try:
-        risk_engine.start_trip_monitoring(
+        origin = normalize_lat_lon(request.origin, "origin")
+        destination = normalize_lat_lon(request.destination, "destination")
+        route_status = risk_engine.start_trip_monitoring(
             trip_id=request.trip_id,
-            origin=(request.origin["lat"], request.origin["lon"]),
-            destination=(request.destination["lat"], request.destination["lon"]),
+            origin=origin,
+            destination=destination,
         )
         trip_sensor_history[request.trip_id].clear()
         return {
             "trip_id": request.trip_id,
             "status": "monitoring_started",
-            "route_loaded": True,
+            "route_loaded": bool(route_status.get("enabled")),
+            "route_status": route_status,
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/predict", response_model=RiskAssessmentResponse)
@@ -180,6 +183,27 @@ def build_harsh_events(history: Deque[Dict]) -> List[Dict]:
         if ax > 4.0 or ax < -4.0:
             events.append({"timestamp": h["timestamp"] / 1000, "value": ax})
     return events
+
+
+def normalize_lat_lon(value: Dict, field_name: str) -> Tuple[float, float]:
+    """
+    Accept multiple coordinate shapes from app/function payloads.
+    Supported keys:
+    - lat/lon
+    - latitude/longitude
+    - _latitude/_longitude (Firestore GeoPoint JSON-like)
+    """
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object with coordinates")
+
+    lat = value.get("lat", value.get("latitude", value.get("_latitude")))
+    lon = value.get("lon", value.get("lng", value.get("longitude", value.get("_longitude"))))
+
+    if lat is None or lon is None:
+        raise ValueError(
+            f"{field_name} is missing coordinates. Provide lat/lon (or latitude/longitude)."
+        )
+    return float(lat), float(lon)
 
 
 def extract_features_for_model(trip_id: str, history: Deque[Dict], expected_features: List[str]) -> Dict[str, float]:

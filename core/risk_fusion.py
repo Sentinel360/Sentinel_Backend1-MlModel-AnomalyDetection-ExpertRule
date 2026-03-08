@@ -50,13 +50,20 @@ class RiskFusionEngine:
             else:
                 print("\u26a0\ufe0f No Google API key \u2014 route monitoring disabled")
             self.route_detectors[trip_id] = None
-            return
+            return {'enabled': False, 'reason': 'NO_ROUTE_MONITORING'}
 
-        self.route_detectors[trip_id] = RouteAnomalyDetector(
-            origin=origin, destination=destination,
-            google_api_key=self.google_api_key,
-        )
-        print(f"\u2705 Started route monitoring for trip {trip_id}")
+        try:
+            self.route_detectors[trip_id] = RouteAnomalyDetector(
+                origin=origin, destination=destination,
+                google_api_key=self.google_api_key,
+            )
+            print(f"\u2705 Started route monitoring for trip {trip_id}")
+            return {'enabled': True, 'reason': 'ROUTE_MONITORING_ACTIVE'}
+        except Exception as e:
+            # Keep trip operational even if route init fails.
+            print(f"\u26a0\ufe0f Route monitoring init failed for {trip_id}: {e}")
+            self.route_detectors[trip_id] = None
+            return {'enabled': False, 'reason': f'ROUTE_INIT_FAILED: {e}'}
 
     def end_trip_monitoring(self, trip_id: str) -> Dict:
         summary: Dict = {'trip_id': trip_id, 'route_summary': None}

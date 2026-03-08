@@ -62,6 +62,20 @@ class RouteAnomalyDetector:
 
     # ------------------------------------------------------------------ fetch
 
+    @staticmethod
+    def _normalize_polyline_points(points) -> List[Tuple[float, float]]:
+        """
+        Normalize polyline points into (lat, lon) tuples.
+        googlemaps.convert.decode_polyline returns list[dict(lat,lng)].
+        """
+        normalized: List[Tuple[float, float]] = []
+        for p in points:
+            if isinstance(p, dict):
+                normalized.append((float(p['lat']), float(p['lng'])))
+            else:
+                normalized.append((float(p[0]), float(p[1])))
+        return normalized
+
     def _fetch_all_routes(self) -> List[Dict]:
         try:
             directions = self.gmaps.directions(
@@ -74,7 +88,8 @@ class RouteAnomalyDetector:
 
             routes = []
             for rd in directions:
-                poly = googlemaps.convert.decode_polyline(rd['overview_polyline']['points'])
+                decoded = googlemaps.convert.decode_polyline(rd['overview_polyline']['points'])
+                poly = self._normalize_polyline_points(decoded)
                 routes.append({
                     'polyline': poly,
                     'distance': rd['legs'][0]['distance']['value'],
@@ -118,7 +133,8 @@ class RouteAnomalyDetector:
             if data:
                 updated = []
                 for rd in data:
-                    poly = googlemaps.convert.decode_polyline(rd['overview_polyline']['points'])
+                    decoded = googlemaps.convert.decode_polyline(rd['overview_polyline']['points'])
+                    poly = self._normalize_polyline_points(decoded)
                     updated.append({
                         'polyline': poly,
                         'distance': rd['legs'][0]['distance']['value'],
