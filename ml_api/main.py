@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Deque, Dict, List, Tuple
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +22,80 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.risk_fusion import RiskFusionEngine  # noqa: E402
+
+# Simple API key auth for the ML API
+ML_API_KEY = os.environ.get("ML_API_KEY", "")
+
+
+async def verify_api_key(x_api_key: str = Header(default="", alias="X-API-Key")):
+    """Verify API key if ML_API_KEY is set. Skip if not configured (dev mode)."""
+    if not ML_API_KEY:
+        return  # No key configured — open access (development mode)
+    if x_api_key != ML_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+# Weather cache to avoid repeated API calls within the same trip
+_weather_cache: Dict[str, Tuple[float, int]] = {}  # trip_id -> (weather_encoded, timestamp)
+WEATHER_CACHE_TTL = 600  # 10 minutes
+
+
+def _get_weather_encoded(lat: float, lon: float, trip_id: str = "") -> int:
+    """
+    Fetch current weather from OpenWeatherMap and encode it for the ML model.
+    Encoding: 0 = clear/normal, 1 = rain, 2 = heavy_rain/storm, 3 = fog/mist/harmattan
+    Falls back to 0 (clear) if API key is missing or request fails.
+    """
+    # Check cache first
+    now = int(time.time())
+    if trip_id and trip_id in _weather_cache:
+        cached_val, cached_at = _weather_cache[trip_id]
+        if now - cached_at < WEATHER_CACHE_TTL:
+            return int(cached_val)
+
+    api_key = os.environ.get("OPENWEATHER_API_KEY", "")
+    if not api_key:
+        return 0  # No API key — default to clear
+
+    try:
+        import httpx
+
+        resp = httpx.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"lat": lat, "lon": lon, "appid": api_key},
+            timeout=3.0,
+        )
+        if resp.status_code != 200:
+            return 0
+
+        data = resp.json()
+        weather_id = data.get("weather", [{}])[0].get("id", 800)
+
+        # OpenWeatherMap condition codes:
+        # 2xx = Thunderstorm, 3xx = Drizzle, 5xx = Rain
+        # 7xx = Atmosphere (fog, mist, haze, dust = harmattan)
+        # 800 = Clear, 80x = Clouds
+
+        if 200 <= weather_id < 300:  # Thunderstorm
+            encoded = 2
+        elif 500 <= weather_id < 510:  # Light-moderate rain
+            encoded = 1
+        elif 510 <= weather_id < 600:  # Heavy rain
+            encoded = 2
+        elif 300 <= weather_id < 400:  # Drizzle
+            encoded = 1
+        elif 700 <= weather_id < 800:  # Fog/mist/haze/dust (harmattan)
+            encoded = 3
+        else:  # Clear or cloudy
+            encoded = 0
+
+        # Cache result
+        if trip_id:
+            _weather_cache[trip_id] = (encoded, now)
+
+        return encoded
+    except Exception:
+        return 0  # Network error — default to clear
+
 
 app = FastAPI(title="Sentinel360 ML API", version="1.0.0")
 
@@ -78,7 +153,7 @@ def root() -> Dict:
     }
 
 
-@app.post("/trip/start")
+@app.post("/trip/start", dependencies=[Depends(verify_api_key)])
 def start_trip(request: TripStartRequest) -> Dict:
     try:
         origin = normalize_lat_lon(request.origin, "origin")
@@ -99,7 +174,7 @@ def start_trip(request: TripStartRequest) -> Dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/predict", response_model=RiskAssessmentResponse)
+@app.post("/predict", response_model=RiskAssessmentResponse, dependencies=[Depends(verify_api_key)])
 def predict_risk(request: SensorDataRequest) -> RiskAssessmentResponse:
     try:
         history = trip_sensor_history[request.trip_id]
@@ -166,7 +241,7 @@ def predict_risk(request: SensorDataRequest) -> RiskAssessmentResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/trip/end")
+@app.post("/trip/end", dependencies=[Depends(verify_api_key)])
 def end_trip(request: TripEndRequest) -> Dict:
     try:
         summary = risk_engine.end_trip_monitoring(request.trip_id)
@@ -206,6 +281,23 @@ def normalize_lat_lon(value: Dict, field_name: str) -> Tuple[float, float]:
     return float(lat), float(lon)
 
 
+def _haversine_track_distance(lats: np.ndarray, lons: np.ndarray) -> float:
+    """Compute cumulative haversine distance (km) along a GPS track."""
+    if len(lats) < 2:
+        return 0.0
+    R = 6371.0  # Earth radius in km
+    lat_r = np.radians(lats)
+    lon_r = np.radians(lons)
+    dlat = np.diff(lat_r)
+    dlon = np.diff(lon_r)
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat_r[:-1]) * np.cos(lat_r[1:]) * np.sin(dlon / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    segments = R * c
+    # Filter out GPS jumps (> 5 km between consecutive 1-second points is clearly noise)
+    segments = segments[segments < 5.0]
+    return float(np.sum(segments))
+
+
 def extract_features_for_model(trip_id: str, history: Deque[Dict], expected_features: List[str]) -> Dict[str, float]:
     speeds = np.array([h["speed"] for h in history], dtype=float) if history else np.array([0.0])
     accel_x = np.array([h["ax"] for h in history], dtype=float) if history else np.array([0.0])
@@ -226,45 +318,84 @@ def extract_features_for_model(trip_id: str, history: Deque[Dict], expected_feat
         avg_dt_h = 0.0
     total_distance_km = float(np.sum(speeds * avg_dt_h))
 
-    now = datetime.now()
-    time_of_day = now.hour
-    day_of_week = now.weekday()
+    # FIX: Use event timestamp (not server time) for temporal features.
+    # The mobile app sends millisecond-epoch timestamps; derive hour/month from
+    # the actual moment the sensor data was captured, not when the server processes it.
+    event_dt = datetime.fromtimestamp(timestamps[-1] / 1000) if timestamps[-1] > 0 else datetime.now()
+    time_of_day = event_dt.hour
+    day_of_week = event_dt.weekday()
+    event_month = event_dt.month
+
+    # FIX: Compute GPS-based distance instead of relying solely on speed × dt.
+    # When we have lat/lon history, accumulate haversine distances between consecutive
+    # points for a more accurate trip_distance estimate.
+    lats = np.array([h.get("lat", 0.0) for h in history], dtype=float) if history else np.array([0.0])
+    lons = np.array([h.get("lon", 0.0) for h in history], dtype=float) if history else np.array([0.0])
+    gps_distance_km = _haversine_track_distance(lats, lons)
+    # Use GPS distance when available (more accurate), fall back to speed-based estimate
+    best_distance_km = gps_distance_km if gps_distance_km > 0.001 else total_distance_km
+
+    # FIX: Derive road_encoded from current speed as a proxy for road type.
+    # Motorway typically ≥80 km/h, arterial 40-80, residential <40.
+    # This is a practical approximation without a full road database.
+    current_speed = float(speeds[-1])
+    if current_speed >= 80:
+        road_enc = 1.0  # highway/motorway
+    elif current_speed < 30:
+        road_enc = 2.0  # residential/unpaved
+    else:
+        road_enc = 0.0  # urban/arterial (default)
+
+    # FIX: Derive traffic_encoded from speed variance vs average.
+    # High variance + low speed → congested; steady high speed → sparse.
+    speed_std = float(np.std(speeds))
+    avg_speed = float(np.mean(speeds))
+    if avg_speed < 15 and speed_std > 5:
+        traffic_enc = 2.0  # congested
+    elif avg_speed > 60:
+        traffic_enc = 0.0  # sparse / free-flow
+    else:
+        traffic_enc = 1.0  # normal
+
+    # Get weather for current location
+    avg_lat = float(np.mean(lats)) if len(lats) > 0 and np.max(lats) != 0 else 0.0
+    avg_lon = float(np.mean(lons)) if len(lons) > 0 and np.max(lons) != 0 else 0.0
 
     candidates: Dict[str, float] = {
         # Original risk_fusion-style feature set
-        "avg_speed": float(np.mean(speeds)),
+        "avg_speed": avg_speed,
         "max_speed": float(np.max(speeds)),
-        "speed_std": float(np.std(speeds)),
+        "speed_std": speed_std,
         "avg_acceleration": float(np.mean(np.abs(accel_x))),
         "max_acceleration": float(np.max(np.abs(accel_x))),
         "harsh_accel_count": float(harsh_accel_count),
         "harsh_brake_count": float(harsh_brake_count),
         "stop_count": float(stop_count),
         "avg_stop_duration": 0.0,
-        "total_distance": total_distance_km,
-        "distance_per_stop": float(total_distance_km / max(stop_count, 1)),
+        "total_distance": best_distance_km,
+        "distance_per_stop": float(best_distance_km / max(stop_count, 1)),
         "time_of_day": float(time_of_day),
         "day_of_week": float(day_of_week),
         "trip_duration": duration_s,
         "speed_changes": float(np.sum(np.abs(np.diff(speeds)) > 10.0)) if len(speeds) > 1 else 0.0,
         "route_straightness": 0.85,
         "idle_time_ratio": float(stop_count / max(len(speeds), 1)),
-        "avg_trip_speed": float(total_distance_km / duration_h) if duration_h > 0 else float(np.mean(speeds)),
+        "avg_trip_speed": float(best_distance_km / duration_h) if duration_h > 0 else avg_speed,
         # Simulation-style feature set
-        "speed": float(speeds[-1]),
+        "speed": current_speed,
         "acceleration": float(accel_x[-1]),
         "acceleration_variation": float(np.std(accel_x)),
-        "trip_distance": total_distance_km,
+        "trip_distance": best_distance_km,
         "stop_events": float(stop_count),
-        "road_encoded": 0.0,
-        "weather_encoded": 0.0,
-        "traffic_encoded": 1.0,
+        "road_encoded": road_enc,
+        "weather_encoded": float(_get_weather_encoded(avg_lat, avg_lon, trip_id=trip_id) if avg_lat != 0 else 0),
+        "traffic_encoded": traffic_enc,
         "hour": float(time_of_day),
-        "month": float(now.month),
-        "stops_per_km": float(stop_count / max(total_distance_km, 0.1)),
+        "month": float(event_month),
+        "stops_per_km": float(stop_count / max(best_distance_km, 0.1)),
         "accel_abs": float(abs(accel_x[-1])),
-        "speed_normalized": float(speeds[-1] / 100.0),
-        "speed_squared": float(speeds[-1] ** 2),
+        "speed_normalized": float(current_speed / 100.0),
+        "speed_squared": float(current_speed ** 2),
         "is_rush_hour": float(1 if (7 <= time_of_day < 10 or 16 <= time_of_day < 19) else 0),
         "is_night": float(1 if (time_of_day >= 22 or time_of_day <= 5) else 0),
     }
