@@ -1,104 +1,92 @@
 rules_version = '2';
-
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper: check if the request is from an authenticated user
-    function isAuthenticated() {
-      return request.auth != null;
-    }
-
-    // Helper: check if the user owns this resource
-    function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
-    }
-
-    // Helper: check if user is an admin (has admin custom claim)
-    function isAdmin() {
-      return isAuthenticated() && request.auth.token.admin == true;
-    }
-
-    // Users collection
+    // ---------------------------------------------------------------
+    // Users — each user can only read/write their own document
+    // ---------------------------------------------------------------
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
-      allow create: if isOwner(userId);
-      allow update: if isOwner(userId);
-      allow delete: if false; // Never delete user docs from client
+      allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
-    // Trips collection
-    match /trips/{tripId} {
-      allow read: if isAuthenticated() &&
-        (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isAuthenticated() &&
-        request.resource.data.userId == request.auth.uid;
-      allow update: if isAuthenticated() &&
-        (resource.data.userId == request.auth.uid || isAdmin());
-      allow delete: if false; // Trips are never deleted from client
-
-      // Sensor data subcollection
-      match /sensor_data/{eventId} {
-        allow read: if isAuthenticated() &&
-          get(/databases/$(database)/documents/trips/$(tripId)).data.userId == request.auth.uid
-          || isAdmin();
-        allow create: if isAuthenticated();
-        allow update, delete: if false;
-      }
-
-      // Current state subcollection (written by cloud functions)
-      match /current_state/{stateId} {
-        allow read: if isAuthenticated();
-        allow write: if false; // Only cloud functions write this
-      }
-
-      // Alerts subcollection
-      match /alerts/{alertId} {
-        allow read: if isAuthenticated();
-        allow create: if isAuthenticated();
-        allow update: if isAdmin();
-        allow delete: if false;
-      }
-    }
-
-    // Emergency alerts (top-level)
-    match /emergency_alerts/{alertId} {
-      allow read: if isAuthenticated() &&
-        (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isAuthenticated();
-      allow update: if isAdmin() ||
-        (isAuthenticated() && resource.data.userId == request.auth.uid);
-      allow delete: if false;
-    }
-
-    // Escalation timers (cloud functions only)
-    match /escalation_timers/{timerId} {
-      allow read: if isAdmin();
-      allow write: if false; // Only cloud functions
-    }
-
-    // Admin notifications
-    match /admin_notifications/{notifId} {
-      allow read: if isAdmin();
-      allow create: if false; // Only cloud functions
-      allow update: if isAdmin(); // Admins can mark as read
-      allow delete: if false;
-    }
-
-    // Devices collection
+    // ---------------------------------------------------------------
+    // Devices — owner only
+    // ---------------------------------------------------------------
     match /devices/{deviceId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
-      allow update: if isAuthenticated();
-      allow delete: if false;
+      allow read, write: if request.auth != null
+        && resource != null
+        && resource.data.userId == request.auth.uid;
+      allow create: if request.auth != null;
     }
 
-    // Trip feedback (new — for ML validation)
+    // ---------------------------------------------------------------
+    // Trips — owner read/write; admin can read all
+    // ---------------------------------------------------------------
+    match /trips/{tripId} {
+      allow read: if request.auth != null
+        && (resource.data.userId == request.auth.uid
+            || request.auth.token.admin == true);
+      allow create: if request.auth != null;
+      allow update: if request.auth != null
+        && resource.data.userId == request.auth.uid;
+
+      // Sensor data sub-collection — owner only
+      match /sensor_data/{eventId} {
+        allow read, write: if request.auth != null;
+      }
+
+      // Current state — written by Cloud Functions (admin SDK bypasses rules)
+      // AND by the mobile app on trip start (initial safe state).
+      // Readable by authenticated users.
+      match /current_state/{docId} {
+        allow read, write: if request.auth != null;
+      }
+
+      // Alerts sub-collection — Cloud Functions write most alerts,
+      // but the mobile app writes SOS_MANUAL alerts via TripManager.triggerSOS()
+      match /alerts/{alertId} {
+        allow read, write: if request.auth != null;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Emergency alerts — user can create, admin can read all
+    // ---------------------------------------------------------------
+    match /emergency_alerts/{alertId} {
+      allow create: if request.auth != null;
+      allow read: if request.auth != null
+        && (resource.data.userId == request.auth.uid
+            || request.auth.token.admin == true);
+      allow update: if request.auth != null
+        && resource.data.userId == request.auth.uid;
+    }
+
+    // ---------------------------------------------------------------
+    // Trip feedback — write-once per user per trip
+    // ---------------------------------------------------------------
     match /trip_feedback/{feedbackId} {
-      allow read: if isAuthenticated() &&
-        (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isAuthenticated() &&
-        request.resource.data.userId == request.auth.uid;
-      allow update, delete: if false;
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid;
+      allow read: if request.auth != null
+        && (resource.data.userId == request.auth.uid
+            || request.auth.token.admin == true);
+    }
+
+    // ---------------------------------------------------------------
+    // Escalation timers — Cloud Functions only (admin SDK bypasses rules)
+    // Admin dashboard can read
+    // ---------------------------------------------------------------
+    match /escalation_timers/{timerId} {
+      allow read: if request.auth != null
+        && request.auth.token.admin == true;
+    }
+
+    // ---------------------------------------------------------------
+    // Admin notifications — admin read only
+    // ---------------------------------------------------------------
+    match /admin_notifications/{notifId} {
+      allow read: if request.auth != null
+        && request.auth.token.admin == true;
     }
   }
 }

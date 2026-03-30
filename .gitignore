@@ -24,6 +24,7 @@ Thumbs.db
 
 # Node / Firebase functions
 cloud_functions/node_modules/
+cloud_functions/.env.sentinel360-final
 
 # Environment
 .env

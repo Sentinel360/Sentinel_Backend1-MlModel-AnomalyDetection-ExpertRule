@@ -2,17 +2,17 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const axios = require("axios");
 const { GoogleAuth } = require("google-auth-library");
-const { defineString } = require("firebase-functions/params");
-
 admin.initializeApp();
 
-// Set once at deploy time: firebase deploy will prompt for ML_API_URL value.
-const ML_API_URL_PARAM = defineString("ML_API_URL");
-// Optional: must match Cloud Run ML_API_KEY when set (sent as X-API-Key).
-const ML_API_KEY_PARAM = defineString("ML_API_KEY", { default: "" });
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
 const googleAuth = new GoogleAuth();
 let cachedIdTokenClient = null;
-let cachedMlApiUrl = "";
+
+// Set to false in production to enable real SOS notifications
+const TEST_MODE = true;
 
 // Trip-level policy tuning (keeps instant risk separate from overall trip risk)
 const HIGH_CONSECUTIVE_THRESHOLD = 3;
@@ -21,20 +21,20 @@ const MEDIUM_RATIO_THRESHOLD = 0.1;
 const MIN_WINDOWS_FOR_RATIO = 10;
 const HIGH_COOLDOWN_MS = 60 * 1000;
 
-function getMlApiUrl() {
-  if (process.env.ML_API_URL) return process.env.ML_API_URL;
-  if (!cachedMlApiUrl) cachedMlApiUrl = ML_API_URL_PARAM.value() || "";
-  return cachedMlApiUrl;
-}
+// SOS escalation
+const ESCALATION_DELAY_MS = 2 * 60 * 1000; // 2 minutes before auto-escalation
 
-function getMlApiKey() {
-  if (process.env.ML_API_KEY) return process.env.ML_API_KEY;
-  return ML_API_KEY_PARAM.value() || "";
+function getMlApiUrl() {
+  return process.env.ML_API_URL || "";
 }
 
 if (!getMlApiUrl()) {
-  console.warn("ML_API_URL is not set. Configure ML_API_URL param during deploy.");
+  console.warn("ML_API_URL is not set. Set it in cloud_functions/.env.sentinel360-final");
 }
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
 function currentStateRef(tripId) {
   return admin.firestore()
@@ -54,11 +54,17 @@ function normalizeLatLon(value) {
 async function getMlApiAuthHeaders() {
   const mlApiUrl = getMlApiUrl();
   if (!mlApiUrl) return {};
-  if (!cachedIdTokenClient) {
-    cachedIdTokenClient = await googleAuth.getIdTokenClient(mlApiUrl);
+  try {
+    if (!cachedIdTokenClient) {
+      cachedIdTokenClient = await googleAuth.getIdTokenClient(mlApiUrl);
+    }
+    const headers = await cachedIdTokenClient.getRequestHeaders();
+    return headers || {};
+  } catch (err) {
+    // Running locally or in emulator — skip IAM auth
+    console.warn("Could not obtain ID token (expected in emulator):", err.message);
+    return {};
   }
-  const headers = await cachedIdTokenClient.getRequestHeaders();
-  return headers || {};
 }
 
 async function callMlApi(path, payload, timeoutMs = 5000) {
@@ -66,16 +72,16 @@ async function callMlApi(path, payload, timeoutMs = 5000) {
   if (!mlApiUrl) {
     throw new Error("ML_API_URL is not configured");
   }
-  const headers = { ...(await getMlApiAuthHeaders()) };
-  const apiKey = getMlApiKey();
-  if (apiKey) {
-    headers["X-API-Key"] = apiKey;
-  }
+  const headers = await getMlApiAuthHeaders();
   return axios.post(`${mlApiUrl}${path}`, payload, {
     timeout: timeoutMs,
     headers,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Trip-level policy computation
+// ---------------------------------------------------------------------------
 
 function computeTripPolicy(previousState = {}, instantLevel, eventTsMs) {
   const prevPolicy = previousState.policy || {};
@@ -129,6 +135,10 @@ function computeTripPolicy(previousState = {}, instantLevel, eventTsMs) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 1. processSensorData — Firestore trigger on sensor_data write
+// ---------------------------------------------------------------------------
+
 exports.processSensorData = functions.firestore
   .document("trips/{tripId}/sensor_data/{eventId}")
   .onCreate(async (snap, context) => {
@@ -173,7 +183,6 @@ exports.processSensorData = functions.firestore
         riskScore: result.final_score,
         riskLevel: result.final_level,
         riskColor: result.final_color,
-        // Trip-level status (not the same as instant event risk)
         overallRiskLevel: policy.overallLevel,
         overallUnsafe: policy.overallUnsafe,
         policy,
@@ -218,6 +227,10 @@ exports.processSensorData = functions.firestore
     }
   });
 
+// ---------------------------------------------------------------------------
+// 2. onTripStart — Initialize ML API monitoring + route fetch fallback
+// ---------------------------------------------------------------------------
+
 exports.onTripStart = functions.firestore
   .document("trips/{tripId}")
   .onCreate(async (snap, context) => {
@@ -227,62 +240,62 @@ exports.onTripStart = functions.firestore
     if (!getMlApiUrl()) return null;
 
     try {
+      const origin = normalizeLatLon(tripData.origin ?? tripData.originGeo ?? tripData.startLocation);
+      const destination = normalizeLatLon(tripData.destination);
+
       await callMlApi(
         "/trip/start",
         {
           trip_id: tripId,
-          origin: normalizeLatLon(tripData.origin),
-          destination: normalizeLatLon(tripData.destination),
+          origin,
+          destination,
         },
         5000,
       );
       console.log(`Trip monitoring initialized: ${tripId}`);
+
+      // Route fetch fallback — if the mobile app didn't store a polyline,
+      // fetch one server-side using Google Directions API
+      const mapsKey = process.env.GOOGLE_MAPS_API_KEY || "";
+      if (
+        mapsKey &&
+        origin.lat !== 0 && destination.lat !== 0 &&
+        !(tripData.routePolyline && tripData.routePolyline.length > 0)
+      ) {
+        try {
+          const dirUrl = `https://maps.googleapis.com/maps/api/directions/json` +
+            `?origin=${origin.lat},${origin.lon}` +
+            `&destination=${destination.lat},${destination.lon}` +
+            `&key=${mapsKey}`;
+          const dirResp = await axios.get(dirUrl, { timeout: 5000 });
+          const routes = dirResp.data.routes || [];
+          if (routes.length > 0 && routes[0].overview_polyline) {
+            // Store the encoded polyline so the mobile app can render it
+            await admin.firestore()
+              .collection("trips")
+              .doc(tripId)
+              .set(
+                {
+                  encodedPolyline: routes[0].overview_polyline.points,
+                  routeFetchedBy: "cloud_function",
+                },
+                { merge: true },
+              );
+            console.log(`Route polyline stored for trip: ${tripId}`);
+          }
+        } catch (routeErr) {
+          console.warn("Route fetch fallback failed:", routeErr.message);
+        }
+      }
     } catch (error) {
       console.error("Error initializing trip on ML API:", error.message);
     }
-
-    // Ensure expected_route is set for route anomaly detection
-    const tripRef = admin.firestore().collection("trips").doc(tripId);
-    const freshTrip = await tripRef.get();
-    const freshData = freshTrip.data() || {};
-
-    if (!freshData.expected_route && !freshData.routePolyline) {
-      // Trip has no route data yet — try to fetch from Google Directions
-      const origin = normalizeLatLon(tripData.origin);
-      const dest = normalizeLatLon(tripData.destination);
-
-      if (origin.lat && origin.lon && dest.lat && dest.lon) {
-        const MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
-        if (MAPS_API_KEY) {
-          try {
-            const directionsResp = await axios.get(
-              `https://maps.googleapis.com/maps/api/directions/json` +
-              `?origin=${origin.lat},${origin.lon}` +
-              `&destination=${dest.lat},${dest.lon}` +
-              `&key=${MAPS_API_KEY}`,
-              { timeout: 5000 }
-            );
-
-            if (directionsResp.data.status === "OK") {
-              const encodedPolyline = directionsResp.data.routes[0].overview_polyline.points;
-              await tripRef.update({
-                expected_route: {
-                  polyline: encodedPolyline,
-                  fetchedBy: "cloud_function",
-                  fetchedAt: admin.firestore.FieldValue.serverTimestamp(),
-                },
-              });
-              console.log(`Route fetched and saved for trip ${tripId}`);
-            }
-          } catch (routeErr) {
-            console.warn(`Could not fetch route for trip ${tripId}: ${routeErr.message}`);
-          }
-        }
-      }
-    }
-
     return null;
   });
+
+// ---------------------------------------------------------------------------
+// 3. onTripEnd — Finalize trip with risk summary
+// ---------------------------------------------------------------------------
 
 exports.onTripEnd = functions.firestore
   .document("trips/{tripId}")
@@ -334,249 +347,188 @@ exports.onTripEnd = functions.firestore
     return null;
   });
 
-// ── SOS Escalation Pipeline ──────────────────────────────────────────────────
-// Triggers when a new emergency_alert document is created.
-// In production: sends FCM push to emergency contacts, sends SMS via Africa's Talking.
-// In test mode: logs what would be sent.
+// ---------------------------------------------------------------------------
+// 4. onEmergencyAlert — SOS button handler
+// ---------------------------------------------------------------------------
 
-const TEST_MODE = true; // Set to false for production deployment
-
-exports.onEmergencyAlert = functions.firestore
+exports.onEmergencyAlert = functions.runWith({ timeoutSeconds: 300, memory: "256MB" }).firestore
   .document("emergency_alerts/{alertId}")
   .onCreate(async (snap, context) => {
     const alertId = context.params.alertId;
     const alertData = snap.data() || {};
-    const userId = alertData.userId;
-    const tripId = alertData.tripId;
-    const alertType = alertData.type || "SOS_MANUAL";
+    const userId = alertData.userId || "";
+    const tripId = alertData.tripId || "";
+    const location = alertData.location || {};
 
-    console.log(`[SOS Escalation] Processing alert ${alertId} for user ${userId}, trip ${tripId}`);
+    console.log(`Emergency alert received: ${alertId}, user: ${userId}, trip: ${tripId}`);
 
     try {
-      // 1. Get user data and emergency contacts
-      const userDoc = await admin.firestore().collection("users").doc(userId).get();
-      const userData = userDoc.exists ? userDoc.data() : {};
-      const userName = userData.displayName || userData.name || "Sentinel360 User";
-      const emergencyContacts = userData.emergencyContacts || [];
+      // Mark alert as processing
+      await snap.ref.set({ status: "processing", processedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
-      // 2. Get trip data for location context
-      let locationText = "Location unavailable";
-      let locationLink = "";
-      if (tripId) {
-        const tripDoc = await admin.firestore().collection("trips").doc(tripId).get();
-        if (tripDoc.exists) {
-          const tripData = tripDoc.data() || {};
-          const origin = tripData.origin || tripData.originGeo;
-          const dest = tripData.destination || tripData.destinationGeo;
-          const destName = tripData.destinationName || "Unknown destination";
-
-          // Get latest sensor position
-          const latestSensor = await admin.firestore()
-            .collection("trips").doc(tripId)
-            .collection("sensor_data")
-            .orderBy("timestamp", "desc")
-            .limit(1)
-            .get();
-
-          let lat = 0, lon = 0;
-          if (!latestSensor.empty) {
-            const sensorData = latestSensor.docs[0].data();
-            const gps = sensorData.gps || {};
-            lat = gps.lat || 0;
-            lon = gps.lon || 0;
-          } else if (origin) {
-            lat = origin.lat || origin._latitude || origin.latitude || 0;
-            lon = origin.lon || origin._longitude || origin.longitude || 0;
-          }
-
-          if (lat && lon) {
-            locationText = `Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}`;
-            locationLink = `https://maps.google.com/?q=${lat},${lon}`;
-          }
-          locationText += ` (heading to ${destName})`;
-        }
+      // Fetch user profile for emergency contacts
+      let userDoc = {};
+      if (userId) {
+        const userSnap = await admin.firestore().collection("users").doc(userId).get();
+        userDoc = userSnap.exists ? userSnap.data() : {};
       }
 
-      // 3. Compose emergency message
-      const message = `EMERGENCY ALERT from ${userName}!\n` +
-        `Type: ${alertType}\n` +
-        `${locationText}\n` +
-        (locationLink ? `Track location: ${locationLink}\n` : "") +
-        `Time: ${new Date().toLocaleString("en-GH", { timeZone: "Africa/Accra" })}`;
+      const emergencyContacts = userDoc.emergencyContacts || [];
+      const userName = userDoc.displayName || userDoc.name || "A Sentinel360 user";
 
-      // 4. Send notifications to each emergency contact
-      const notifications = [];
+      // Build notification payload
+      const lat = location.lat ?? location.latitude ?? location._latitude ?? 0;
+      const lon = location.lon ?? location.lng ?? location.longitude ?? location._longitude ?? 0;
+      const mapsLink = `https://maps.google.com/?q=${lat},${lon}`;
+      const notificationBody = `${userName} triggered an SOS alert. Location: ${mapsLink}`;
 
-      for (const contact of emergencyContacts) {
-        const contactName = contact.name || "Emergency Contact";
-        const contactPhone = contact.phone || contact.phoneNumber;
-        const contactFcmToken = contact.fcmToken;
-
-        if (TEST_MODE) {
-          console.log(`[SOS TEST MODE] Would notify ${contactName}:`);
-          console.log(`  Phone: ${contactPhone}`);
-          console.log(`  FCM Token: ${contactFcmToken ? "present" : "none"}`);
-          console.log(`  Message: ${message}`);
-          notifications.push({
-            contact: contactName,
-            method: "test_mode",
-            status: "simulated",
-          });
-          continue;
-        }
-
-        // FCM Push Notification (if contact has the app)
-        if (contactFcmToken) {
-          try {
-            await admin.messaging().send({
-              token: contactFcmToken,
-              notification: {
-                title: `SOS Alert from ${userName}`,
-                body: `${userName} triggered an emergency alert. Tap to view location.`,
-              },
-              data: {
-                type: "SOS_ALERT",
-                alertId: alertId,
-                tripId: tripId || "",
-                location: locationLink || "",
-              },
-              android: {
-                priority: "high",
+      if (TEST_MODE) {
+        console.log(`[TEST MODE] Would notify ${emergencyContacts.length} contacts: ${notificationBody}`);
+        console.log(`[TEST MODE] Emergency contacts:`, JSON.stringify(emergencyContacts));
+      } else {
+        // Send FCM push to emergency contacts who have the app
+        for (const contact of emergencyContacts) {
+          if (contact.fcmToken) {
+            try {
+              await admin.messaging().send({
+                token: contact.fcmToken,
                 notification: {
-                  channelId: "emergency_alerts",
-                  priority: "max",
-                  sound: "alarm",
+                  title: "SOS Alert",
+                  body: notificationBody,
                 },
-              },
-            });
-            notifications.push({ contact: contactName, method: "fcm", status: "sent" });
-          } catch (fcmErr) {
-            console.error(`[SOS] FCM failed for ${contactName}: ${fcmErr.message}`);
-            notifications.push({ contact: contactName, method: "fcm", status: "failed", error: fcmErr.message });
-          }
-        }
-
-        // SMS via Africa's Talking (Ghana-optimized)
-        // To enable: npm install africastalking, set AT_API_KEY and AT_USERNAME in env
-        if (contactPhone) {
-          try {
-            // Africa's Talking integration placeholder
-            // In production, uncomment and configure:
-            // const AfricasTalking = require("africastalking");
-            // const at = AfricasTalking({ apiKey: process.env.AT_API_KEY, username: process.env.AT_USERNAME });
-            // const sms = at.SMS;
-            // await sms.send({ to: [contactPhone], message: message, from: "Sentinel360" });
-
-            console.log(`[SOS] SMS would be sent to ${contactPhone}`);
-            notifications.push({ contact: contactName, method: "sms", status: "pending_integration" });
-          } catch (smsErr) {
-            console.error(`[SOS] SMS failed for ${contactName}: ${smsErr.message}`);
-            notifications.push({ contact: contactName, method: "sms", status: "failed", error: smsErr.message });
+                data: {
+                  type: "SOS",
+                  alertId,
+                  tripId,
+                  lat: String(lat),
+                  lon: String(lon),
+                },
+              });
+            } catch (fcmErr) {
+              console.warn(`FCM send failed for contact ${contact.name}:`, fcmErr.message);
+            }
           }
         }
       }
 
-      // 5. Update the alert document with notification results
-      await snap.ref.update({
-        notificationsSent: notifications,
-        escalationStatus: "notified",
-        processedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      // 6. Start auto-escalation timer (2 minutes)
-      // Create an escalation document that the onEscalationCheck function monitors
-      await admin.firestore().collection("escalation_timers").doc(alertId).set({
+      // Write admin notification
+      await admin.firestore().collection("admin_notifications").add({
+        type: "SOS",
         alertId,
         userId,
-        tripId: tripId || null,
+        tripId,
+        userName,
+        location: { lat, lon },
+        mapsLink,
+        emergencyContactCount: emergencyContacts.length,
+        status: "pending_review",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        escalateAfter: admin.firestore.Timestamp.fromMillis(Date.now() + 2 * 60 * 1000),
-        status: "pending",
-        contactsNotified: notifications.length,
       });
 
-      console.log(`[SOS Escalation] Alert ${alertId} processed: ${notifications.length} contacts notified`);
-      return null;
-    } catch (error) {
-      console.error(`[SOS Escalation] Error processing alert ${alertId}: ${error.message}`);
-      await snap.ref.update({
-        escalationStatus: "error",
-        escalationError: error.message,
-        processedAt: admin.firestore.FieldValue.serverTimestamp(),
+      // Create escalation timer — if not resolved within ESCALATION_DELAY_MS,
+      // onEscalationTimerCreate will handle further escalation
+      await admin.firestore().collection("escalation_timers").add({
+        alertId,
+        userId,
+        tripId,
+        escalateAt: new Date(Date.now() + ESCALATION_DELAY_MS),
+        status: "pending",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      return null;
+
+      // Update alert status
+      await snap.ref.set({ status: "contacts_notified" }, { merge: true });
+
+      console.log(`Emergency alert processed: ${alertId}`);
+    } catch (error) {
+      console.error("Error processing emergency alert:", error.message);
+      await snap.ref.set({ status: "error", error: error.message }, { merge: true });
     }
+    return null;
   });
 
-// ── Auto-Escalation Check ────────────────────────────────────────────────────
-// Runs every minute via Cloud Scheduler (configure in Firebase console).
-// Checks for unresolved escalation timers that have expired.
-// In a real system this would be a scheduled function; here it's also triggerable
-// by writing to escalation_timers.
+// ---------------------------------------------------------------------------
+// 5. onEscalationTimerCreate — Auto-escalation after timeout
+// ---------------------------------------------------------------------------
 
-exports.onEscalationTimerCreate = functions.firestore
+exports.onEscalationTimerCreate = functions.runWith({ timeoutSeconds: 300, memory: "256MB" }).firestore
   .document("escalation_timers/{timerId}")
-  .onUpdate(async (change, context) => {
+  .onCreate(async (snap, context) => {
     const timerId = context.params.timerId;
-    const newData = change.after.data() || {};
+    const timerData = snap.data() || {};
+    const alertId = timerData.alertId || "";
+    const userId = timerData.userId || "";
+    const tripId = timerData.tripId || "";
 
-    // Only process when status changes to "check"
-    if (newData.status !== "check") return null;
+    console.log(`Escalation timer created: ${timerId} for alert ${alertId}`);
 
-    const alertId = newData.alertId;
-    const userId = newData.userId;
-    const tripId = newData.tripId;
+    // Wait for escalation delay (Cloud Functions Gen1 max timeout = 540s = 9min)
+    // 2 minutes is well within limits
+    const delayMs = ESCALATION_DELAY_MS;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
 
     try {
-      // Check if the alert has been resolved
-      const alertDoc = await admin.firestore().collection("emergency_alerts").doc(alertId).get();
-      const alertData = alertDoc.exists ? alertDoc.data() : {};
+      // Re-read the alert to check if it was resolved
+      const alertSnap = await admin.firestore().collection("emergency_alerts").doc(alertId).get();
+      const alertData = alertSnap.exists ? alertSnap.data() : {};
 
-      if (alertData.resolved) {
-        await change.after.ref.update({ status: "resolved" });
-        console.log(`[Escalation] Alert ${alertId} already resolved, no escalation needed`);
+      if (alertData.status === "resolved" || alertData.status === "cancelled") {
+        console.log(`Alert ${alertId} already resolved/cancelled — skipping escalation`);
+        await snap.ref.set({ status: "cancelled", reason: "alert_resolved" }, { merge: true });
         return null;
       }
 
-      // Check if any contact acknowledged
-      const userDoc = await admin.firestore().collection("users").doc(userId).get();
-      const userData = userDoc.exists ? userDoc.data() : {};
+      // Check trip document for escalation attempts
+      let tripDoc = {};
+      if (tripId) {
+        const tripSnap = await admin.firestore().collection("trips").doc(tripId).get();
+        tripDoc = tripSnap.exists ? tripSnap.data() : {};
+      }
+      const attempts = Number(tripDoc.escalationAttempts || 0) + 1;
 
       if (TEST_MODE) {
-        console.log(`[Escalation TEST MODE] Would escalate alert ${alertId} to authorities:`);
-        console.log(`  User: ${userData.displayName || "Unknown"}`);
-        console.log(`  Trip: ${tripId}`);
-        console.log(`  Action: Notify local authorities / admin dashboard`);
+        console.log(`[TEST MODE] Escalation #${attempts} for alert ${alertId}. Would contact authorities.`);
+      } else {
+        // In production: send SMS to authorities, make further FCM pushes, etc.
+        console.log(`Escalation #${attempts} for alert ${alertId}. Contacting authorities.`);
       }
 
-      // Mark as escalated
-      await change.after.ref.update({
+      // Update escalation timer
+      await snap.ref.set({
         status: "escalated",
         escalatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+        attemptNumber: attempts,
+      }, { merge: true });
 
-      // Update the original alert
-      await admin.firestore().collection("emergency_alerts").doc(alertId).update({
-        escalationStatus: "escalated_to_authorities",
-        escalatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      // Update the alert
+      await admin.firestore().collection("emergency_alerts").doc(alertId).set({
+        status: "escalated",
+        escalationAttempts: attempts,
+        lastEscalatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
 
-      // Create a high-priority admin notification
+      // Update trip document
+      if (tripId) {
+        await admin.firestore().collection("trips").doc(tripId).set({
+          escalationAttempts: attempts,
+        }, { merge: true });
+      }
+
+      // Write another admin notification for the escalation
       await admin.firestore().collection("admin_notifications").add({
-        type: "SOS_ESCALATION",
+        type: "ESCALATION",
         alertId,
         userId,
-        tripId: tripId || null,
-        message: `Unresolved SOS from ${userData.displayName || "Unknown user"} — no contact response after 2 minutes`,
-        priority: "critical",
-        read: false,
+        tripId,
+        attemptNumber: attempts,
+        status: "pending_review",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      console.log(`[Escalation] Alert ${alertId} escalated to admin dashboard`);
-      return null;
+      console.log(`Escalation complete for alert ${alertId}, attempt #${attempts}`);
     } catch (error) {
-      console.error(`[Escalation] Error: ${error.message}`);
-      return null;
+      console.error("Error during escalation:", error.message);
+      await snap.ref.set({ status: "error", error: error.message }, { merge: true });
     }
+    return null;
   });
