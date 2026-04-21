@@ -12,4 +12,5 @@ COPY ml_api/main.py ./main.py
 
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Cloud Run sets PORT (often 8080); must bind to $PORT per https://cloud.google.com/run/docs/container-contract
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

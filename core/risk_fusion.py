@@ -36,6 +36,7 @@ class RiskFusionEngine:
         self.expert_rules = ExpertRulesEngine()
         self.google_api_key = google_api_key
         self.route_detectors: Dict[str, Optional[object]] = {}
+        self._trip_state: Dict[str, Dict] = {}
 
         print("\u2705 Risk Fusion Engine initialized")
 
@@ -44,6 +45,8 @@ class RiskFusionEngine:
     def start_trip_monitoring(
         self, trip_id: str, origin: tuple, destination: tuple,
     ):
+        self._trip_state[trip_id] = {'routeDeviationConfirmed': False}
+
         if not self.google_api_key or not _HAS_ROUTE:
             if not _HAS_ROUTE:
                 print("\u26a0\ufe0f Route monitoring unavailable (missing googlemaps/shapely/pyproj)")
@@ -67,10 +70,25 @@ class RiskFusionEngine:
 
     def end_trip_monitoring(self, trip_id: str) -> Dict:
         summary: Dict = {'trip_id': trip_id, 'route_summary': None}
+        self._trip_state.pop(trip_id, None)
         det = self.route_detectors.pop(trip_id, None)
         if det is not None:
             summary['route_summary'] = det.get_trip_summary()
         return summary
+
+    @staticmethod
+    def _route_deviation_confirmed(route_result: Dict) -> bool:
+        """
+        True when RouteAnomalyDetector indicates sustained material deviation.
+        Mirrors detector thresholds (e.g. CRITICAL_DEVIATION / consecutive≥5) without importing detector internals.
+        """
+        if route_result.get('status') == 'NO_ROUTE_MONITORING':
+            return False
+        if route_result.get('status') in ('CRITICAL_DEVIATION', 'WRONG_DIRECTION'):
+            return True
+        if route_result.get('triggered') is True and route_result.get('consecutive_seconds', 0) >= 5:
+            return True
+        return False
 
     # ------------------------------------------------------------ assessment
 
@@ -93,6 +111,17 @@ class RiskFusionEngine:
             gps = context.get('current_location', (0, 0))
             route_result = det.update(gps, ts)
         route_adj = route_result.get('risk_adjustment', 0.0)
+
+        trip_state = self._trip_state.setdefault(
+            trip_id, {'routeDeviationConfirmed': False},
+        )
+        deviation_confirmed = self._route_deviation_confirmed(route_result)
+        if deviation_confirmed:
+            trip_state['routeDeviationConfirmed'] = True
+
+        # Route deviation persistence — once confirmed, do not reset on subsequent on-route readings
+        if trip_state.get('routeDeviationConfirmed') and route_adj <= 0:
+            route_adj = max(route_adj, 0.20)
 
         # Fusion
         final = max(0.0, min(1.0, ml_score + route_adj + rules_adj))

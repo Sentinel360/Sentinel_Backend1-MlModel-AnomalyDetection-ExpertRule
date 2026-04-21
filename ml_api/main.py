@@ -37,9 +37,23 @@ from core.risk_fusion import RiskFusionEngine  # noqa: E402
 
 app = FastAPI(title="Sentinel360 ML API", version="1.0.0")
 
-# MODEL_DIR: check APP_DIR/models first (Docker), then PROJECT_ROOT/models (local)
-_default_model_dir = str(APP_DIR / "models") if (APP_DIR / "models").exists() else str(PROJECT_ROOT / "models")
-MODEL_DIR = os.getenv("MODEL_DIR", _default_model_dir)
+# MODEL_DIR: Docker image has models at /app/models. If env is wrong (e.g. /models) or empty, fall back.
+_app_models = APP_DIR / "models"
+_default_model_dir = str(_app_models) if _app_models.is_dir() else str(PROJECT_ROOT / "models")
+_model_dir_env = os.getenv("MODEL_DIR", "").strip()
+if _model_dir_env:
+    _cand = Path(_model_dir_env)
+    if not _cand.is_absolute():
+        _cand = (APP_DIR / _model_dir_env).resolve()
+    if (_cand / "ghana_gb_model.pkl").is_file():
+        MODEL_DIR = str(_cand)
+    else:
+        print(
+            f"WARNING: MODEL_DIR={_model_dir_env!r} has no model files; using {_default_model_dir}",
+        )
+        MODEL_DIR = _default_model_dir
+else:
+    MODEL_DIR = _default_model_dir
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 WINDOW_SIZE = int(os.getenv("FEATURE_WINDOW_SIZE", "10"))
 ML_API_KEY = os.getenv("ML_API_KEY", "")  # optional auth
